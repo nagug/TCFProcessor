@@ -144,6 +144,15 @@ class TCFProcessor:
         try:
             # The core decoding step
             self.consent_object = decode(self.consent_string)
+            print("--- DEBUG: Attributes of consent_object ---")
+            try:
+                # Option 1: Print all attributes
+                print(dir(self.consent_object))
+                # Option 2: Print attributes and their values (if reasonable)
+                # print(vars(self.consent_object))
+            except Exception as e:
+                print(f"Error inspecting object: {e}")
+            print("--- END DEBUG ---")
             print("Successfully decoded TCF string.")
         except Exception as e:
             # Catch general Exception as specific iab_tcf exceptions may not be importable
@@ -375,36 +384,68 @@ class TCFProcessor:
         Finds vendors for whom the user has established Legitimate Interest (LI)
         status via the TCF string.
 
-        It checks the `legitimate_interest_vendors` map in the decoded consent object.
+        It checks the decoded consent object, likely using a method like is_interest_allowed().
         For vendors where LI is established, it retrieves their name and the LI purposes
         they declare in the GVL (`legIntPurposes`).
 
         Returns:
             dict: A dictionary mapping vendor IDs (int) to details:
-                  `{ vendor_id: {'name': str, 'declared_li_purposes': list[int]} }`
-                  Returns empty dict if consent object unavailable, decoding failed,
-                  the LI attribute is missing, or no vendors have LI established.
+                `{ vendor_id: {'name': str, 'declared_li_purposes': list[int]} }`
+                Returns empty dict if consent object unavailable, decoding failed,
+                or no vendors have LI established.
         """
         if not self.consent_object or self.error_state:
             print("Warning: Cannot get LI vendors, consent object not available or init error.")
             return {}
-        if not hasattr(self.consent_object, 'legitimate_interest_vendors'):
-            print("Warning: Decoded object missing 'legitimate_interest_vendors' attribute.")
+
+        # --- MODIFICATION START ---
+        # Check if the method 'is_interest_allowed' exists, instead of the attribute
+        if not hasattr(self.consent_object, 'is_interest_allowed'):
+            # If even the method isn't there, something is fundamentally wrong or
+            # we need to parse interests_vendors_range manually
+            print("ERROR: Decoded object missing expected 'is_interest_allowed' method.")
+            print("       Cannot determine LI vendors. Check iab-tcf library version/documentation.")
             return {}
 
-        li_vendors_dict = self.consent_object.legitimate_interest_vendors
         result = {}
+        # Determine the range of vendor IDs to check.
+        # We can check all vendors in the GVL, or up to max_interests_vendor_id if available.
+        # Using GVL keys is safer if GVL is loaded.
+        vendors_to_check = []
+        if self.gvl_vendors_dict:
+            try:
+                # Convert GVL string keys back to int for checking
+                vendors_to_check = [int(vid) for vid in self.gvl_vendors_dict.keys()]
+            except ValueError:
+                print("Warning: Could not parse vendor IDs from GVL keys.")
+                # Fallback needed? Or maybe check up to max_interests_vendor_id?
+                # max_id = getattr(self.consent_object, 'max_interests_vendor_id', 0)
+                # vendors_to_check = range(1, max_id + 1) # Less ideal as relies on another attr
 
-        print(f"Checking {len(li_vendors_dict)} potential LI vendors...")
-        for vendor_id, li_established in li_vendors_dict.items():
-            # Check if LI is established (value is True)
-            if li_established:
-                vendor_gvl_data = self._get_vendor_gvl_data(vendor_id)
-                declared_li_purposes = vendor_gvl_data.get('legIntPurposes', [])
-                result[vendor_id] = {
-                    'name': vendor_gvl_data.get('name', 'unknown'),
-                    'declared_li_purposes': declared_li_purposes
-                }
+        if not vendors_to_check:
+            print("Warning: No vendor IDs available to check for LI.")
+            return {}
+
+
+        print(f"Checking {len(vendors_to_check)} potential LI vendors using 'is_interest_allowed'...")
+        for vendor_id in vendors_to_check:
+            try:
+                # Call the method to check LI status for this vendor ID
+                li_established = self.consent_object.is_interest_allowed(vendor_id)
+
+                if li_established:
+                    vendor_gvl_data = self._get_vendor_gvl_data(vendor_id)
+                    declared_li_purposes = vendor_gvl_data.get('legIntPurposes', [])
+                    result[vendor_id] = {
+                        'name': vendor_gvl_data.get('name', 'unknown (check GVL)'), # Added note
+                        'declared_li_purposes': declared_li_purposes
+                    }
+            except Exception as e:
+                # Catch potential errors during the check for a specific vendor
+                print(f"Warning: Error checking LI for vendor {vendor_id}: {e}")
+                continue # Skip to the next vendor
+
+        # --- MODIFICATION END ---
 
         print(f"Found {len(result)} vendors with Legitimate Interest established by user.")
         return result
@@ -646,6 +687,107 @@ class TCFProcessor:
         """
         return self._get_consented_vendors_by_gvl_flag('usesNonCookieAccess')
 
+    def prepare_data_for_storage(self) -> dict | None:
+        """
+        Prepares processed TCF data into a structured dictionary for storage (e.g., MongoDB).
+        This method is part of the TCFProcessor class.
+
+        Returns:
+            A dictionary containing structured TCF data and stats, or None if
+            decoding failed or the instance is invalid.
+        """
+        # Basic validation: Ensure decoding was successful
+        if self.error_state or not self.consent_object:
+            print("Error: Cannot prepare data. Decoding failed or consent object not available.")
+            return None
+
+        print("\n--- Preparing Data for Storage ---")
+
+        # --- 1. Gather Core Data Components ---
+        print("Gathering core data components...")
+        # Call internal methods using self
+        metadata = self.get_metadata()
+        consented_vendor_details = self.get_consented_vendors(include_details=True)
+        li_vendor_dict = self.get_vendors_using_legitimate_interest() # Returns {id: details}
+        cmp_details = self.get_cmp_details()
+
+        # Handle potential None returns if methods failed internally
+        if metadata is None: metadata = {"error": "Failed to retrieve metadata"}
+        # Ensure lists/dicts exist even if empty for consistent structure
+        if consented_vendor_details is None: consented_vendor_details = []
+        if li_vendor_dict is None: li_vendor_dict = {}
+        if cmp_details is None: cmp_details = {"error": "Failed to retrieve CMP details"}
+
+
+        # --- 2. Calculate Counts and Augment Metadata ---
+        print("Calculating statistics...")
+        consented_vendor_count = len(consented_vendor_details)
+        li_established_vendor_count = len(li_vendor_dict) # User established LI
+
+        uses_cookies_count = 0
+        uses_non_cookie_count = 0
+        vendors_with_special_purposes = 0
+        vendors_with_features = 0
+        vendors_with_special_features = 0
+        vendors_with_flexible_purposes = 0
+        consented_vendors_declaring_li = 0 # Vendors in consent list who *declare* LI
+
+        # Iterate through details list which already contains GVL info
+        for vendor in consented_vendor_details:
+            if vendor.get('usesCookies', False):
+                uses_cookies_count += 1
+            if vendor.get('usesNonCookieAccess', False):
+                uses_non_cookie_count += 1
+            if vendor.get('specialPurposes'):
+                vendors_with_special_purposes += 1
+            if vendor.get('features'):
+                vendors_with_features += 1
+            if vendor.get('specialFeatures'):
+                vendors_with_special_features += 1
+            if vendor.get('flexiblePurposes'):
+                vendors_with_flexible_purposes += 1
+            if vendor.get('legIntPurposes'):
+                consented_vendors_declaring_li += 1
+
+        # Add statistics under a 'stats' sub-key in metadata
+        # Ensure metadata is a dict before adding stats
+        if not isinstance(metadata, dict):
+            metadata = {'original_metadata_error': metadata} # Preserve original error if any
+
+        metadata['stats'] = {
+            'consented_vendor_count': consented_vendor_count,
+            'li_established_vendor_count': li_established_vendor_count,
+            'consented_uses_cookies_count': uses_cookies_count,
+            'consented_uses_non_cookie_count': uses_non_cookie_count,
+            'consented_with_special_purposes_count': vendors_with_special_purposes,
+            'consented_with_features_count': vendors_with_features,
+            'consented_with_special_features_count': vendors_with_special_features,
+            'consented_with_flexible_purposes_count': vendors_with_flexible_purposes,
+            'consented_vendors_declaring_li_purposes_count': consented_vendors_declaring_li,
+        }
+        metadata['processed_at'] = datetime.now(timezone.utc).isoformat()
+        # Optionally include the original TCF string using self
+        # metadata['tcf_string'] = self.consent_string
+
+        # --- 3. Format Legitimate Interest Vendor List ---
+        print("Formatting LI vendor list...")
+        # Create a list of LI vendor details including the ID
+        legitimate_interest_vendors_list = [
+            {'id': vid, **details} for vid, details in li_vendor_dict.items()
+        ]
+
+        # --- 4. Construct Final Payload ---
+        print("Assembling final payload...")
+        storage_payload = {
+            'metadata': metadata,
+            'consented_vendors': consented_vendor_details, # Already a list of dicts
+            'legitimate_interest_vendors': legitimate_interest_vendors_list,
+            'cmp_details': cmp_details
+        }
+
+        print("Payload preparation finished.")
+        return storage_payload
+
 
 # --- Example Usage ---
 if __name__ == "__main__":
@@ -793,6 +935,31 @@ if __name__ == "__main__":
     print(f"Consented Vendors Using Non-Cookie Access: Count={len(non_cookie_vendors)}")
     # print subset...
     print("-" * 25)
+
+    mongo_payload = processor.prepare_data_for_storage()
+
+    if mongo_payload:
+        print("\n--- Data Payload for Storage (Sample Output) ---")
+        # Pretty print the JSON-like dictionary structure for inspection
+        # Limiting output for brevity
+        print("Metadata (with Stats):")
+        print(json.dumps(mongo_payload.get('metadata', {}), indent=2, default=str))
+        print("\nConsented Vendors (Count):", len(mongo_payload.get('consented_vendors', [])))
+        print("Sample:", json.dumps(mongo_payload.get('consented_vendors', [])[:2], indent=2, default=str)) # Sample
+        print("\nLI Vendors (Count):", len(mongo_payload.get('legitimate_interest_vendors', [])))
+        print("Sample:", json.dumps(mongo_payload.get('legitimate_interest_vendors', [])[:2], indent=2, default=str)) # Sample
+        print("\nCMP Details:")
+        print(json.dumps(mongo_payload.get('cmp_details', {}), indent=2, default=str))
+        print("-" * 25)
+
+        # ----------------------------------------------------
+        # Placeholder: Add your MongoDB insertion code here
+        # (See previous example for pymongo usage)
+        # ----------------------------------------------------
+        print("\n(Placeholder: Add MongoDB insertion logic here)")
+
+    else:
+        print("\nFailed to generate data payload for storage (likely due to earlier errors).")
 
 
     print("\n--- Script Finished ---")
